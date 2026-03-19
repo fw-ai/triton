@@ -91,7 +91,7 @@ class RaggedTensorMetadata:
 
 def ragged_metadata_fields(metadata, block_size):
     return (metadata.slice_sizes, metadata.slice_offs, metadata.block_offs(block_size),
-            metadata.block_schedule(block_size), metadata.expected_slice_size, metadata.slice_sizes_divisibility or 1)
+            metadata.block_schedule(block_size), None, metadata.slice_sizes_divisibility or 1)
 
 
 # utilities

@@ -375,6 +375,10 @@ def matmul(a, b, bias,
                                  fused_comm.n_reduce_shards if fused_comm is not None else 1,
                                  opt_flags)
     memory = apply_allocation(allocation, c)
+    # Scatter writeback only touches destination rows that appear in WriteBackIndx.
+    # # Untargeted rows are expected to read back as zero, so initialize the output buffer.
+    if scatter_indx is not None:
+        memory["output"].zero_()
     # early exit
     if batch_size * M * N == 0:
         ret = memory["output"].squeeze(0)

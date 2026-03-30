@@ -41,24 +41,35 @@ def downcast_to_mxfp(x: torch.Tensor, out_dtype: torch.dtype, axis: int,
             torch.float8_e4m3fn: FP8_E4M3FN,
             torch.float8_e5m2: FP8_E5M2,
         }[out_dtype]
-    assert x.shape[axis] % MXFP_BLOCK_SIZE.value == 0, f"axis dim must be divisible by {MXFP_BLOCK_SIZE.value}. Got {x.shape[axis]}"
     assert isinstance(x.storage.layout, StridedLayout), "input data must be strided"
     assert -x.ndim <= axis < x.ndim, f"Invalid axis {axis=}"
     assert out_dtype in (FP4, FP8_E4M3FN, FP8_E5M2), f"Invalid output dtype {out_dtype=}"
     # handle negative `axis``
     axis = axis if axis >= 0 else axis + x.ndim
-    # downcast
     L = x.shape[axis]
-    # Ensure last dimension is a multiple of MXFP_BLOCK_SIZE. This is expected by the kernel.
-    # output value storage
+    if out_dtype == FP4:
+        assert L % 2 == 0, "For mxfp4 conversion the contiguous axis length must be even."
+
+    padded_L = ((L + MXFP_BLOCK_SIZE.value - 1) // MXFP_BLOCK_SIZE.value) * MXFP_BLOCK_SIZE.value
+    needs_padding = padded_L != L
+
+    # Keep the externally visible value tensor shape unchanged, but launch the Triton
+    # quantizer on a padded temporary when the quantized axis is not block-aligned.
     y_layout = StridedLayout(major_dim=axis - x.ndim)
-    y_scale_shape = (*x.shape[:axis], triton.cdiv(L, MXFP_BLOCK_SIZE), *x.shape[axis+1:])
     y_value = empty(x.shape, out_dtype, x.device, y_layout)
+    y_value_kernel = y_value
+    if needs_padding:
+        padded_value_shape = list(x.shape)
+        padded_value_shape[axis] = padded_L
+        y_value_kernel = empty(padded_value_shape, out_dtype, x.device, y_layout)
+    y_scale_shape = (*x.shape[:axis], padded_L // MXFP_BLOCK_SIZE.value, *x.shape[axis+1:])
     y_scale = empty(y_scale_shape, UINT8, x.device, y_layout)
     if x.numel() > 0:
         # canonicalize to a 2D tensor that paxks 4-bit values on its inner-most dimension
         x_storage = x.storage.data.transpose(axis, -1).reshape(-1, x.shape[axis])
-        y_storage_value = y_value.storage.data.transpose(axis, -1).view(-1, y_value.storage.data.shape[axis])
+        if needs_padding:
+            x_storage = F.pad(x_storage, (0, padded_L - L))
+        y_storage_value = y_value_kernel.storage.data.transpose(axis, -1).view(-1, y_value_kernel.storage.data.shape[axis])
         y_storage_scale = y_scale.storage.data.transpose(axis, -1).view(-1, y_scale.storage.data.shape[axis])
         # performance hyper-parameters
         BLOCK_OUT_DIM = 32
@@ -76,6 +87,10 @@ def downcast_to_mxfp(x: torch.Tensor, out_dtype: torch.dtype, axis: int,
             DEQUANT_SCALE_ROUNDING_MODE.value,
             num_warps=NUM_WARPS,
         )
+        if needs_padding:
+            trim = [slice(None)] * y_value.storage.data.ndim
+            trim[axis] = slice(0, y_value.storage.data.shape[axis])
+            y_value.storage.data.copy_(y_value_kernel.storage.data[tuple(trim)])
     # TODO: return tensor object instead of its storage
     return y_value.storage.data, y_scale.storage.data
 

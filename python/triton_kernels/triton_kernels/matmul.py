@@ -435,11 +435,14 @@ def matmul(a, b, bias,
     a_tma_block_size = [1, opt_flags.block_k] if has_gather_tma else [1, opt_flags.block_m, opt_flags.block_k]
     # Dense X TMA loads a full BLOCK_M tile. For partial-M tiles (M < BLOCK_M) the swizzled
     # dense-TMA fetch can over-read past the X allocation. Zero-pad the X allocation up to BLOCK_M rows
+    # (M == a.storage.data.shape[-2] here: this branch implies gather_indx is None).
     if a_has_tma and ragged_dimension != "K" and not has_gather_tma and M < opt_flags.block_m:
         a_data = a.storage.data
-        pad_m = opt_flags.block_m - a_data.shape[-2]
-        if pad_m > 0:
-            a.storage.data = torch.nn.functional.pad(a_data, (0, 0, 0, pad_m))
+        padded = torch.nn.functional.pad(a_data, (0, 0, 0, opt_flags.block_m - M))
+        # F.pad returns a contiguous tensor, dropping the stride-0 broadcast dims from the
+        # 2D->3D canonicalization; carry the zeros over so batch broadcast still aliases slice 0.
+        restored = [0 if s == 0 else ps for s, ps in zip(a_data.stride(), padded.stride())]
+        a.storage.data = padded.as_strided(padded.shape, restored)
     a_tma_mode = None if not a_has_tma else "ragged" if ragged_dimension == "M" and not has_gather_tma else "dense"
     a_tensor_or_tma = make_tma(a, a_tma_block_size, a_tma_mode) if a_has_tma else a.storage.data
     if a_has_tma and precision_config.allow_tf32 and a.storage.data.dtype == torch.float32:

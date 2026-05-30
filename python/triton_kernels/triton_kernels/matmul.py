@@ -433,6 +433,13 @@ def matmul(a, b, bias,
         c_acc_strides = (None, None, None)
 
     a_tma_block_size = [1, opt_flags.block_k] if has_gather_tma else [1, opt_flags.block_m, opt_flags.block_k]
+    # Dense X TMA loads a full BLOCK_M tile. For partial-M tiles (M < BLOCK_M) the swizzled
+    # dense-TMA fetch can over-read past the X allocation. Zero-pad the X allocation up to BLOCK_M rows
+    if a_has_tma and ragged_dimension != "K" and not has_gather_tma and M < opt_flags.block_m:
+        a_data = a.storage.data
+        pad_m = opt_flags.block_m - a_data.shape[-2]
+        if pad_m > 0:
+            a.storage.data = torch.nn.functional.pad(a_data, (0, 0, 0, pad_m))
     a_tma_mode = None if not a_has_tma else "ragged" if ragged_dimension == "M" and not has_gather_tma else "dense"
     a_tensor_or_tma = make_tma(a, a_tma_block_size, a_tma_mode) if a_has_tma else a.storage.data
     if a_has_tma and precision_config.allow_tf32 and a.storage.data.dtype == torch.float32:

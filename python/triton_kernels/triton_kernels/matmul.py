@@ -434,7 +434,7 @@ def matmul(a, b, bias,
 
     a_tma_block_size = [1, opt_flags.block_k] if has_gather_tma else [1, opt_flags.block_m, opt_flags.block_k]
     # Dense TMA loads a full BLOCK_M tile; use the pointer path for partial-M tiles.
-    if a_has_tma and not has_gather_tma and M < opt_flags.block_m:
+    if a_has_tma and ragged_dimension != "K" and not has_gather_tma and M < opt_flags.block_m:
         a_has_tma = False
     a_tma_mode = None if not a_has_tma else "ragged" if ragged_dimension == "M" and not has_gather_tma else "dense"
     a_tensor_or_tma = make_tma(a, a_tma_block_size, a_tma_mode) if a_has_tma else a.storage.data

@@ -222,6 +222,18 @@ def _pad_partial_m_dense_x(a, block_m):
     rows up to ``block_m`` makes the box land entirely inside a real allocation; the appended rows
     are zeros so they contribute nothing to the matmul.
 
+    CUDA ``oobFill`` does not replace this padding for MXFP4 X:
+
+    - ``make_dense_tma`` builds a ``TensorDescriptor`` with the default ``padding="zero"``, which
+      Triton maps to ``CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE`` (no hardware OOB fill). Only
+      ``padding="nan"`` selects ``CU_TENSOR_MAP_FLOAT_OOB_FILL_NAN_REQUEST_ZERO_FMA``.
+    - That zero-fill mode is only valid for floating-point tensor map types; MXFP4 values use
+      ``CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B``, where the driver API disallows any OOB fill mode
+      other than ``NONE`` (see CUDA tensor-map docs for ``CUtensorMapFloatOOBfill``).
+    - Even where OOB fill applies, it substitutes for indices outside ``globalDim``. The IMA here
+      is from swizzled 128B-line fetches touching bytes past the *physical* allocation while the
+      descriptor already encodes the true ``M``; extending the buffer is the reliable fix.
+
     ``a.storage.data`` is the canonicalized ``[B, M, K]`` storage. If the leading (batch) dim is a
     stride-0 broadcast (the size-1 dim added by ``_canonicalize_storage``, or an ``expand``-ed
     batch), only the single real ``[M, K]`` slice is padded and then re-broadcast, so we never
@@ -465,7 +477,8 @@ def matmul(a, b, bias,
 
     a_tma_block_size = [1, opt_flags.block_k] if has_gather_tma else [1, opt_flags.block_m, opt_flags.block_k]
     # Dense X TMA loads a full BLOCK_M tile; for partial-M tiles (M < BLOCK_M) the swizzled fetch
-    # over-reads past the X allocation. Zero-pad X's M rows up to BLOCK_M (see _pad_partial_m_dense_x).
+    # over-reads past the X allocation (oobFill is unavailable for 16U4_ALIGN16B — see
+    # _pad_partial_m_dense_x). Zero-pad X's M rows up to BLOCK_M.
     # (M == a.storage.data.shape[-2] here: this branch implies gather_indx is None.)
     if a_has_tma and ragged_dimension != "K" and not has_gather_tma and M < opt_flags.block_m:
         _pad_partial_m_dense_x(a, opt_flags.block_m)

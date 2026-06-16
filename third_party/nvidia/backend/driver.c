@@ -641,7 +641,14 @@ static PyObject *fillTMADescriptorTiled(PyObject *self, PyObject *args) {
   CUresult driver_version_result = cuDriverGetVersion(&driver_version);
   assert(driver_version_result == CUDA_SUCCESS);
 
-  if (driver_version <= 13010) {
+  // The cuTensorMapEncodeTiled() bit-85 bug (sporadic Blackwell IMA/MMU faults for
+  // <128KB non-dense tensors; NVIDIA 595.71.05 release notes) is also present in the
+  // CUDA 13.2 forward-compatibility userspace driver (libcuda 595.71.05), which
+  // cuDriverGetVersion() reports as 13020 -- so the original `<= 13010` gate skipped
+  // the mitigation on exactly the driver inference runs against via cuda-compat.
+  // Extend to 13020 to cover it (clearing bit 85 for <128KB tensors is NVIDIA's
+  // documented workaround and is verified to keep numerics correct).
+  if (driver_version <= 13020) {
     int max_byte_index = 0;
     for (int i = 0; i < rank; ++i) {
       int bytes_stride = i == 0 ? elemSize : stridesLL[i - 1];

@@ -213,6 +213,49 @@ def _canonicalize_storage(storage, out_ndim, flex_data):
     return Storage(new_storage_data, storage.layout)
 
 
+def _pad_partial_m_dense_x(a, block_m):
+    """Zero-pad X's M dimension up to ``block_m`` for the dense X TMA on a partial-M tile.
+
+    The persistent dense X TMA always fetches a full ``[block_m, block_k]`` tile. When the tile is
+    partial (``M < block_m``) the swizzled bulk fetch over-reads past the end of the X allocation —
+    benign under the CUDA 13.0 memory layout, an illegal memory access under 13.2. Padding the M
+    rows up to ``block_m`` makes the box land entirely inside a real allocation; the appended rows
+    are zeros so they contribute nothing to the matmul.
+
+    CUDA ``oobFill`` does not replace this padding for MXFP4 X:
+
+    - ``make_dense_tma`` builds a ``TensorDescriptor`` with the default ``padding="zero"``, which
+      Triton maps to ``CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE`` (no hardware OOB fill). Only
+      ``padding="nan"`` selects ``CU_TENSOR_MAP_FLOAT_OOB_FILL_NAN_REQUEST_ZERO_FMA``.
+    - That zero-fill mode is only valid for floating-point tensor map types; MXFP4 values use
+      ``CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B``, where the driver API disallows any OOB fill mode
+      other than ``NONE`` (see CUDA tensor-map docs for ``CUtensorMapFloatOOBfill``).
+    - Even where OOB fill applies, it substitutes for indices outside ``globalDim``. The IMA here
+      is from swizzled 128B-line fetches touching bytes past the *physical* allocation while the
+      descriptor already encodes the true ``M``; extending the buffer is the reliable fix.
+
+    ``a.storage.data`` is the canonicalized ``[B, M, K]`` storage. If the leading (batch) dim is a
+    stride-0 broadcast (the size-1 dim added by ``_canonicalize_storage``, or an ``expand``-ed
+    batch), only the single real ``[M, K]`` slice is padded and then re-broadcast, so we never
+    materialize ``B`` physical copies. Otherwise the full tensor is padded directly.
+    """
+    a_data = a.storage.data
+    m = a_data.shape[-2]
+    pad_rows = block_m - m
+    if pad_rows <= 0:
+        return
+    if a_data.stride(0) == 0:
+        # Broadcast batch dim: pad only the one real slice, then re-broadcast (stride 0) over it.
+        base = a_data[0]
+        padded_base = torch.nn.functional.pad(base, (0, 0, 0, pad_rows))
+        a.storage.data = padded_base.as_strided(
+            (a_data.shape[0], *padded_base.shape),
+            (0, *padded_base.stride()),
+        )
+    else:
+        a.storage.data = torch.nn.functional.pad(a_data, (0, 0, 0, pad_rows))
+
+
 # -----------------------------------------------------------------------------
 # Triton Implementation
 # -----------------------------------------------------------------------------
@@ -433,6 +476,12 @@ def matmul(a, b, bias,
         c_acc_strides = (None, None, None)
 
     a_tma_block_size = [1, opt_flags.block_k] if has_gather_tma else [1, opt_flags.block_m, opt_flags.block_k]
+    # Dense X TMA loads a full BLOCK_M tile; for partial-M tiles (M < BLOCK_M) the swizzled fetch
+    # over-reads past the X allocation (oobFill is unavailable for 16U4_ALIGN16B — see
+    # _pad_partial_m_dense_x). Zero-pad X's M rows up to BLOCK_M.
+    # (M == a.storage.data.shape[-2] here: this branch implies gather_indx is None.)
+    if a_has_tma and ragged_dimension != "K" and not has_gather_tma and M < opt_flags.block_m:
+        _pad_partial_m_dense_x(a, opt_flags.block_m)
     a_tma_mode = None if not a_has_tma else "ragged" if ragged_dimension == "M" and not has_gather_tma else "dense"
     a_tensor_or_tma = make_tma(a, a_tma_block_size, a_tma_mode) if a_has_tma else a.storage.data
     if a_has_tma and precision_config.allow_tf32 and a.storage.data.dtype == torch.float32:

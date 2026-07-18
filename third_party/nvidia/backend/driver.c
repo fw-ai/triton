@@ -641,14 +641,18 @@ static PyObject *fillTMADescriptorTiled(PyObject *self, PyObject *args) {
   CUresult driver_version_result = cuDriverGetVersion(&driver_version);
   assert(driver_version_result == CUDA_SUCCESS);
 
-  // The cuTensorMapEncodeTiled() bit-85 bug (sporadic Blackwell IMA/MMU faults for
-  // <128KB non-dense tensors; NVIDIA 595.71.05 release notes) is also present in the
-  // CUDA 13.2 forward-compatibility userspace driver (libcuda 595.71.05), which
-  // cuDriverGetVersion() reports as 13020 -- so the original `<= 13010` gate skipped
-  // the mitigation on exactly the driver inference runs against via cuda-compat.
-  // Extend to 13020 to cover it (clearing bit 85 for <128KB tensors is NVIDIA's
-  // documented workaround and is verified to keep numerics correct).
-  if (driver_version <= 13020) {
+  // The cuTensorMapEncodeTiled() bit-85 bug (sporadic Blackwell IMA/MMU faults
+  // for <128KB non-dense tensors; NVIDIA 595.71.05 release notes) is also
+  // present in the CUDA 13.2 and 13.3 forward-compatibility userspace drivers.
+  // They report 13020 and 13030 respectively, even when the host kernel driver
+  // is still affected. Gating only through 13020 therefore regressed MXFP4 MoE
+  // under NGC 26.06: persistent UTMALDG.5D kernels hit deterministic illegal
+  // memory accesses on B200.
+  //
+  // Keep the official <128KB condition below and extend the
+  // compatibility-driver gate through CUDA 13.3. Clearing bit 85 is NVIDIA's
+  // documented workaround.
+  if (driver_version <= 13030) {
     int max_byte_index = 0;
     for (int i = 0; i < rank; ++i) {
       int bytes_stride = i == 0 ? elemSize : stridesLL[i - 1];
